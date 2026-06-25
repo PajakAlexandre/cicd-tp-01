@@ -1,0 +1,8 @@
+services:
+  managed-node:
+    build: .
+    container_name: managed-node
+    ports:
+      - "2222:22"
+      - "80:80"
+    restart: unless-stopped

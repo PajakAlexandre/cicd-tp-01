@@ -1,0 +1,111 @@
+name: Ansible Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  ansible:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      ##########################################################################
+      # MANAGED NODE — Docker container acting as the remote SSH target
+      ##########################################################################
+
+      - name: Generate SSH key pair
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa -N ""
+          cp ~/.ssh/id_rsa.pub ansible/authorized_keys
+
+      - name: Build managed node image
+        run: docker build -t managed-node ./ansible
+
+      - name: Start managed node container
+        run: |
+          docker compose up -d
+        working-directory: ./ansible
+
+      - name: Wait for SSH to be ready
+        run: |
+          TIMEOUT=30
+          ELAPSED=0
+          until ssh -o StrictHostKeyChecking=no -o ConnectTimeout=2 \
+              -i ~/.ssh/id_rsa -p 2222 ynov@127.0.0.1 echo "SSH ready" 2>/dev/null; do
+            if [ $ELAPSED -ge $TIMEOUT ]; then
+              echo "Timed out waiting for SSH after ${TIMEOUT}s"
+              docker logs managed-node
+              exit 1
+            fi
+            echo "Waiting for SSH... (${ELAPSED}s)"
+            sleep 2
+            ELAPSED=$((ELAPSED + 2))
+          done
+
+      ##########################################################################
+      # ANSIBLE
+      ##########################################################################
+      - name: Install Ansible and tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible ansible-lint
+
+      ##########################################################################
+      # LINT & SECURITY — run before playbook execution
+      ##########################################################################
+
+      - name: Ansible Lint
+        id: lint
+        run: ansible-lint deploy.yml > ansible-lint-report.txt 2>&1
+        working-directory: ./ansible
+        continue-on-error: true
+
+      - name: Checkov - Ansible Security Scan
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ./ansible
+          framework: ansible
+          output_format: github_failed_only
+          output_file_path: ./ansible
+          quiet: true
+          soft_fail: true
+
+      - name: Checkov Report
+        id: checkov-report
+        if: always()
+        working-directory: ./ansible
+        run: |
+          while IFS= read -r line; do
+            echo "$line" >> $GITHUB_STEP_SUMMARY
+          done < results_github_failed_only.md
+
+      - name: Run Ansible Playbook
+        run: ansible-playbook deploy.yml -i hosts_docker --private-key ~/.ssh/id_rsa
+        working-directory: ./ansible
+
+      - name: Verify Nginx is running on managed node
+        run: |
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -p 2222 ynov@127.0.0.1 \
+            "pgrep nginx && echo 'Nginx is running' || (echo 'Nginx is NOT running' && exit 1)"
+
+      - name: Verify Nginx serves HTTP traffic
+        run: |
+          status=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:80)
+          echo "HTTP status: $status"
+          test "$status" = "200"
+
+      ##########################################################################
+      # REPORT
+      ##########################################################################
+      - name: Publish Report
+        if: always()
+        run: |
+          echo "## Ansible Lint Report" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat ansible/ansible-lint-report.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

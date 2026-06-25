@@ -1,0 +1,17 @@
+---
+- name: Deploy Nginx on managed node
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Installer Nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: true
+
+    - name: Démarrer et activer Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
