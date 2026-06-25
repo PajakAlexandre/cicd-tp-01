@@ -1,3 +1,4 @@
+
 name: Terraform Pipeline
 on:
   push:
@@ -5,19 +6,9 @@ on:
       - main
 
 jobs:
-  terraform-check:
+  lint:
+    name: Lint & Security Scan
     runs-on: ubuntu-latest
-    services:
-      localstack:
-        image: localstack/localstack:3
-        env:
-          SERVICES: ec2,s3,ssm
-          DEFAULT_REGION: us-east-1
-          AWS_ACCESS_KEY_ID: test
-          AWS_SECRET_ACCESS_KEY: test
-        ports:
-          - 4566:4566
-          - 4571:4571
     steps:
       - uses: actions/checkout@v4
 
@@ -26,40 +17,29 @@ jobs:
         with:
           terraform_wrapper: false
 
-      # -----------------------------------------------------------------------
-      # TODO: Add a Terraform Format step to check that all .tf files are
-      #       properly formatted. Hint — the step skeleton looks like:
-      #
-      # - name: Terraform Format
-      #   id: fmt
-      #   run: terraform fmt .....
-      #   working-directory: ./terraform
-      # -----------------------------------------------------------------------
+      - name: Terraform Format
+        id: fmt
+        run: terraform fmt -check -recursive
+        working-directory: ./terraform
 
-      # -----------------------------------------------------------------------
-      # TODO: Add a Terraform Init step to initialise the working directory.
-      #       Hint — the step skeleton looks like:
-      #
-      # - name: Terraform Init
-      #   id: init
-      #   run: terraform init .....
-      #   working-directory: ./terraform
-      # -----------------------------------------------------------------------
+      - name: Terraform Init (no backend)
+        run: terraform init -input=false -backend=false
+        working-directory: ./terraform
 
-      # -----------------------------------------------------------------------
-      # TODO: Add a Terraform Plan step to preview the changes Terraform will
-      #       make. Hint — the step skeleton looks like:
-      #
-      # - name: Terraform Plan
-      #   id: plan
-      #   run: terraform plan .....
-      #   working-directory: ./terraform
-      #   continue-on-error: true
-      #
-      # - name: Terraform Plan Status
-      #   if: steps.plan.outcome == 'failure'
-      #   run: exit 1
-      # -----------------------------------------------------------------------
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: ./terraform
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: TFLint
+        run: |
+          tflint --init
+          tflint --recursive
+        working-directory: ./terraform
 
       - name: Checkov - Terraform Security Scan
         id: checkov
@@ -81,44 +61,28 @@ jobs:
             echo "$line" >> $GITHUB_STEP_SUMMARY
           done < results_github_failed_only.md
 
-      # -----------------------------------------------------------------------
-      # TODO: Add the Infracost setup action to install the Infracost CLI and
-      #       authenticate with your API key.
-      #       Hint — use the action: infracost/actions/setup@v3
-      #              and pass api-key: ${{ secrets.INFRACOST_API_KEY }}
-      # -----------------------------------------------------------------------
+  plan:
+    name: Terraform Plan
+    needs: lint
+    runs-on: ubuntu-latest
+    services:
+      localstack:
+        image: localstack/localstack:3
+        env:
+          SERVICES: ec2,s3,ssm
+          DEFAULT_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        ports:
+          - 4566:4566
+          - 4571:4571
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Infracost Breakdown
-        id: infracost
-        run: |
-          infracost breakdown --path=./terraform --terraform-var-file=dev.tfvars --format json --out-file /tmp/infracost.json
-          infracost output --path /tmp/infracost.json --format table --out-file /tmp/infracost-table.txt
-          cat /tmp/infracost-table.txt
-
-      # -----------------------------------------------------------------------
-      # TODO: Add a Terraform Apply step to deploy the infrastructure.
-      #       Hint — the step skeleton looks like:
-      #
-      # - name: Terraform Apply
-      #   run: terraform apply .....
-      #   working-directory: ./terraform
-      # -----------------------------------------------------------------------
-
-      # -----------------------------------------------------------------------
-      # TODO (bonus): Once Infracost is set up, publish its cost table to the
-      #               GitHub job summary using $GITHUB_STEP_SUMMARY.
-      # -----------------------------------------------------------------------
-
-      - name: Install Python 3
-        uses: actions/setup-python@v5
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
         with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        working-directory: ./python
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          terraform_wrapper: false
 
       - name: Wait for LocalStack to be ready
         run: |
@@ -134,6 +98,107 @@ jobs:
             sleep 2
             ELAPSED=$((ELAPSED + 2))
           done
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -input=false
+        working-directory: ./terraform
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -input=false -var-file=dev.tfvars -out=tfplan
+        working-directory: ./terraform
+        continue-on-error: true
+
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Infracost Breakdown
+        id: infracost
+        run: |
+          infracost breakdown --path=./terraform --terraform-var-file=dev.tfvars --format json --out-file /tmp/infracost.json
+          infracost output --path /tmp/infracost.json --format table --out-file /tmp/infracost-table.txt
+          cat /tmp/infracost-table.txt
+
+      - name: Infracost Report
+        run: cat /tmp/infracost-table.txt >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/tfplan
+          retention-days: 1
+
+  apply:
+    name: Terraform Apply
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: production
+    services:
+      localstack:
+        image: localstack/localstack:3
+        env:
+          SERVICES: ec2,s3,ssm
+          DEFAULT_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        ports:
+          - 4566:4566
+          - 4571:4571
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Wait for LocalStack to be ready
+        run: |
+          TIMEOUT=60
+          ELAPSED=0
+          until curl -s http://localhost:4566/_localstack/health | grep -E '"s3"[[:space:]]*:[[:space:]]*"(running|available)"'; do
+            if [ $ELAPSED -ge $TIMEOUT ]; then
+              echo "Timed out waiting for LocalStack after ${TIMEOUT}s"
+              curl -s http://localhost:4566/_localstack/health
+              exit 1
+            fi
+            echo "Waiting for LocalStack... (${ELAPSED}s)"
+            sleep 2
+            ELAPSED=$((ELAPSED + 2))
+          done
+
+      - name: Terraform Init
+        run: terraform init -input=false
+        working-directory: ./terraform
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/
+
+      - name: Terraform Apply
+        run: terraform apply -input=false -auto-approve tfplan
+        working-directory: ./terraform
+
+      - name: Install Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        working-directory: ./python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Verify S3 bucket created by Terraform
         run: awslocal s3 ls s3://my-bucket
